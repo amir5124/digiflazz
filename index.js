@@ -40,7 +40,7 @@ app.use(cors());
 
 // Konfigurasi Digiflazz
 const username = "wifisagdYxlo";
-const apiKey = "dev-30da5240-2f12-11f1-b2cf-e36c2cd00ff2";
+const apiKey = "a6e502cc-5d45-5daa-a375-c4e68be9ff98";
 
 // Helper function untuk generate signature
 function generateSignature(ref_id) {
@@ -144,7 +144,7 @@ app.post("/api/get_pricelist", async (req, res) => {
       console.error("❌ [get_pricelist] Unexpected API response format:", JSON.stringify(response.data, null, 2));
       return res.json({
         status: "error",
-        msg: "Format respons dari Digiflazz tidak sesuai"
+        msg: "Produk tidak ditemukan"
       });
     }
 
