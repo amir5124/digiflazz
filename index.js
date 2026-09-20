@@ -1,27 +1,166 @@
+/**
+ * LinkU PPOB Backend (Digiflazz)
+ * ------------------------------------------------------------
+ * Dependensi : npm i express axios cors shortid node-cron firebase dotenv
+ * Konfigurasi: lewat environment variable (lihat bagian CONFIG di bawah)
+ * Log        : console + file harian (./logs/YYYY-MM-DD.log) + endpoint /admin/logs
+ */
+try { require("dotenv").config(); } catch (_) { /* dotenv opsional */ }
+
 const express = require("express");
 const axios = require("axios");
-const bodyParser = require("body-parser");
-const app = express();
 const cors = require("cors");
-const CryptoJS = require("crypto-js");
 const shortid = require("shortid");
-const FormData = require("form-data");
-const crypto = require('crypto');
+const crypto = require("crypto");
 const cron = require("node-cron");
-const port = 3000;
+const fs = require("fs");
+const path = require("path");
+const { AsyncLocalStorage } = require("async_hooks");
 const { initializeApp } = require("firebase/app");
 const {
-  getDatabase,
-  ref,
-  set,
-  get,
-  push,
-  query,
-  orderByChild,
-  equalTo
+  getDatabase, ref, set, get, push, update, query, orderByKey, limitToLast
 } = require("firebase/database");
 
-// ============ FIREBASE CONFIG ============
+const ENV = process.env;
+
+/* ============================================================
+ *  LOGGER
+ * ============================================================ */
+const als = new AsyncLocalStorage();
+const LEVELS = { debug: 10, info: 20, warn: 30, error: 40 };
+const LOG_LEVEL = LEVELS[(ENV.LOG_LEVEL || "debug").toLowerCase()] || LEVELS.debug;
+const LOG_DIR = ENV.LOG_DIR || path.join(__dirname, "logs");
+const LOG_RETENTION_DAYS = parseInt(ENV.LOG_RETENTION_DAYS || "14", 10);
+const MASK_PII = ENV.MASK_PII === "true";
+let LOG_TO_FILE = ENV.LOG_TO_FILE !== "false";
+const RING_MAX = 1000;
+const ringBuffer = [];
+
+if (LOG_TO_FILE) {
+  try { fs.mkdirSync(LOG_DIR, { recursive: true }); }
+  catch (e) { LOG_TO_FILE = false; console.error("Tidak bisa membuat folder log, log file dimatikan:", e.message); }
+}
+
+const SENSITIVE_KEY = /^(sign|apikey|api_key|secret|password|authorization|x-hub-signature|x-admin-secret|cookie)$/i;
+
+function maskTail(s) {
+  s = String(s);
+  return s.length <= 4 ? "****" : "*".repeat(s.length - 4) + s.slice(-4);
+}
+
+function redact(value, depth = 0, key = "") {
+  if (value === null || value === undefined) return value;
+  if (SENSITIVE_KEY.test(key)) return "***";
+  if (MASK_PII && key === "customer_no" && typeof value === "string") return maskTail(value);
+  if (typeof value === "string") return value.length > 300 ? value.slice(0, 300) + `…(+${value.length - 300})` : value;
+  if (typeof value !== "object") return value;
+  if (Buffer.isBuffer(value)) return `[Buffer ${value.length}B]`;
+  if (depth >= 4) return "[depth]";
+  if (Array.isArray(value)) return value.length > 5 ? `[Array(${value.length})]` : value.map(v => redact(v, depth + 1));
+  const out = {};
+  for (const [k, v] of Object.entries(value)) out[k] = redact(v, depth + 1, k);
+  return out;
+}
+
+// Waktu WIB (UTC+7): "YYYY-MM-DD HH:mm:ss.SSS"
+function ts() {
+  const p = new Date(Date.now() + 7 * 3600 * 1000).toISOString();
+  return p.slice(0, 10) + " " + p.slice(11, 23);
+}
+
+function write(level, scope, msg, meta) {
+  if (LEVELS[level] < LOG_LEVEL) return;
+  const store = als.getStore();
+  const rid = store && store.reqId ? ` [${store.reqId}]` : "";
+  let line = `${ts()} ${level.toUpperCase().padEnd(5)}${rid} [${scope}] ${msg}`;
+  if (meta !== undefined) {
+    try { line += " " + JSON.stringify(redact(meta)); } catch (_) { line += " [meta tidak bisa diserialisasi]"; }
+  }
+  (level === "error" ? console.error : console.log)(line);
+  ringBuffer.push(line);
+  if (ringBuffer.length > RING_MAX) ringBuffer.shift();
+  if (LOG_TO_FILE) fs.appendFile(path.join(LOG_DIR, ts().slice(0, 10) + ".log"), line + "\n", () => { });
+}
+
+const Logger = (scope) => ({
+  debug: (m, x) => write("debug", scope, m, x),
+  info: (m, x) => write("info", scope, m, x),
+  warn: (m, x) => write("warn", scope, m, x),
+  error: (m, x) => write("error", scope, m, x)
+});
+
+const log = Logger("app");
+const httpLog = Logger("http");
+const digiLog = Logger("digiflazz");
+const fbLog = Logger("firebase");
+const cacheLog = Logger("cache");
+const trxLog = Logger("trx");
+const hookLog = Logger("webhook");
+const saldoLog = Logger("saldo");
+const cronLog = Logger("cron");
+
+function errMeta(e) {
+  return {
+    name: e && e.name, message: e && e.message, code: e && e.code,
+    status: e && e.response && e.response.status,
+    response: e && e.response && e.response.data,
+    stack: e && e.stack ? e.stack.split("\n").slice(0, 4).join(" | ") : undefined
+  };
+}
+
+function summarizeBody(b) {
+  if (!b || typeof b !== "object") return b;
+  const out = {};
+  for (const k of ["success", "message", "error", "ref_id", "status"]) if (b[k] !== undefined) out[k] = b[k];
+  if (Array.isArray(b.data)) out.dataCount = b.data.length;
+  else if (b.data && typeof b.data === "object") out.data = { status: b.data.status, rc: b.data.rc, message: b.data.message };
+  return out;
+}
+
+function pruneLogs() {
+  if (!LOG_TO_FILE) return;
+  fs.readdir(LOG_DIR, (err, files) => {
+    if (err) return;
+    const cutoff = Date.now() - LOG_RETENTION_DAYS * 86400000;
+    files.filter(f => f.endsWith(".log")).forEach(f => {
+      const p = path.join(LOG_DIR, f);
+      fs.stat(p, (e, st) => { if (!e && st.mtimeMs < cutoff) fs.unlink(p, () => { }); });
+    });
+  });
+}
+
+process.on("unhandledRejection", (reason) => log.error("UnhandledRejection", errMeta(reason instanceof Error ? reason : new Error(String(reason)))));
+process.on("uncaughtException", (err) => log.error("UncaughtException", errMeta(err)));
+
+/* ============================================================
+ *  CONFIG
+ * ============================================================ */
+const CONFIG = {
+  appName: ENV.APP_NAME || "linku",
+  port: parseInt(ENV.PORT || "3000", 10),
+  digiUser: ENV.DIGIFLAZZ_USERNAME,
+  digiKey: ENV.DIGIFLAZZ_API_KEY,
+  adminSecret: ENV.ADMIN_SECRET,          // pengganti REFRESH_SECRET
+  webhookSecret: ENV.WEBHOOK_SECRET,
+  webhookId: ENV.WEBHOOK_ID || "",
+  requireWebhookSig: ENV.REQUIRE_WEBHOOK_SIGNATURE !== "false",
+  saldoApiUrl: ENV.SALDO_API_URL || "https://saldo.siappgo.id/adjust.php",
+  // Potong saldo Jagel dari backend HANYA untuk transaksi yang awalnya Pending lalu Sukses via webhook
+  lateDeduct: ENV.LATE_DEDUCT !== "false",
+  cacheTtlMs: parseInt(ENV.CACHE_TTL_MINUTES || "30", 10) * 60000,
+  pricelistCron: ENV.PRICELIST_CRON || "*/30 * * * *",
+  defaultAdminFee: parseInt(ENV.DEFAULT_ADMIN_FEE || "650", 10)
+};
+
+const missing = ["DIGIFLAZZ_USERNAME", "DIGIFLAZZ_API_KEY", "ADMIN_SECRET", "WEBHOOK_SECRET"].filter(k => !ENV[k]);
+if (missing.length) {
+  log.error(`Environment variable belum di-set: ${missing.join(", ")}. Server dihentikan.`);
+  setTimeout(() => process.exit(1), 300);
+}
+
+/* ============================================================
+ *  FIREBASE
+ * ============================================================ */
 const firebaseConfig = {
   apiKey: "AIzaSyD8P9au26mC8xx8UcjNsm-NMW5JUgTHUBU",
   authDomain: "linku-3ca65.firebaseapp.com",
@@ -31,983 +170,810 @@ const firebaseConfig = {
   messagingSenderId: "759194220603",
   appId: "1:759194220603:web:33e2327dfa94af2552841e"
 };
+const database = getDatabase(initializeApp(firebaseConfig));
 
-const FIREBASE = initializeApp(firebaseConfig);
-const database = getDatabase(FIREBASE);
+// Path khusus LinkU (bisa dioverride lewat env)
+const DB = {
+  cache: ENV.DB_CACHE_PATH || "linku/cache/pricelist",
+  trxPrepaid: ENV.DB_TRX_PREPAID || "linku/trx/prepaid",
+  trxPasca: ENV.DB_TRX_PASCA || "linku/trx/pasca",
+  trxIndex: ENV.DB_TRX_INDEX || "linku/trx/index",
+  webhookLogs: ENV.DB_WEBHOOK_LOGS || "linku/webhook_logs",
+  users: ENV.DB_USERS || "linku/users"
+};
 
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(cors());
+const clean = (o) => JSON.parse(JSON.stringify(o)); // buang undefined (Firebase menolaknya)
+const safeKey = (s) => String(s || "unknown").replace(/[.#$\[\]\/]/g, "_");
 
-// ============ KONFIGURASI DIGIFLAZZ ============
-const username = "mezubogklPao";
-const apiKey = "2eacb14c-4dcb-5a8b-b74f-1ee76df56aab";
-const REFRESH_SECRET = "87linku5590";
-const WEBHOOK_SECRET = "87linku5590";
-const WEBHOOK_ID = "D7nzVo";
-
-// Helper: generate signature transaksi
-function generateSignature(ref_id) {
-  return CryptoJS.MD5(username + apiKey + ref_id).toString();
+async function fbSet(p, v) {
+  const t = Date.now();
+  try { await set(ref(database, p), v); fbLog.debug(`SET ${p}`, { ms: Date.now() - t }); }
+  catch (e) { fbLog.error(`SET gagal ${p}`, errMeta(e)); throw e; }
+}
+async function fbGet(p) {
+  const t = Date.now();
+  try { const s = await get(ref(database, p)); fbLog.debug(`GET ${p}`, { exists: s.exists(), ms: Date.now() - t }); return s; }
+  catch (e) { fbLog.error(`GET gagal ${p}`, errMeta(e)); throw e; }
+}
+async function fbUpdate(p, v) {
+  const t = Date.now();
+  try { await update(ref(database, p), v); fbLog.debug(`UPDATE ${p}`, { ms: Date.now() - t }); }
+  catch (e) { fbLog.error(`UPDATE gagal ${p}`, errMeta(e)); throw e; }
 }
 
-// Helper: generate signature pricelist
-function generatePriceListSignature() {
-  return CryptoJS.MD5(username + apiKey + "pricelist").toString();
-}
+/* ============================================================
+ *  DIGIFLAZZ CLIENT
+ * ============================================================ */
+const md5 = (s) => crypto.createHash("md5").update(s).digest("hex");
+const sigTrx = (refId) => md5(CONFIG.digiUser + CONFIG.digiKey + refId);
+const sigPricelist = () => md5(CONFIG.digiUser + CONFIG.digiKey + "pricelist");
+const sigDeposit = () => md5(CONFIG.digiUser + CONFIG.digiKey + "depo");
 
-// ============ CACHE PRICELIST ============
-let prepaidCache = null;
-let pascaCache = null;
-let prepaidCacheTime = 0;
-let pascaCacheTime = 0;
-const CACHE_TTL = 30 * 60 * 1000;
-
-async function getCachedPrepaid() {
-  if (prepaidCache && (Date.now() - prepaidCacheTime) < CACHE_TTL) {
-    console.log("📦 [Cache] Returning cached prepaid pricelist");
-    return prepaidCache;
-  }
-  console.log("🌐 [Cache] Fetching fresh prepaid pricelist from Digiflazz");
-  const url = "https://api.digiflazz.com/v1/price-list";
-  const data = {
-    cmd: "prepaid",
-    username: username,
-    sign: generatePriceListSignature()
-  };
-  const response = await axios.post(url, data, {
-    headers: { "Content-Type": "application/json" },
-    timeout: 30000
-  });
-  prepaidCache = response.data;
-  prepaidCacheTime = Date.now();
-  return prepaidCache;
-}
-
-async function getCachedPasca() {
-  if (pascaCache && (Date.now() - pascaCacheTime) < CACHE_TTL) {
-    console.log("📦 [Cache] Returning cached pasca pricelist");
-    return pascaCache;
-  }
-  console.log("🌐 [Cache] Fetching fresh pasca pricelist from Digiflazz");
-  const url = "https://api.digiflazz.com/v1/price-list";
-  const data = {
-    cmd: "pasca",
-    username: username,
-    sign: generatePriceListSignature()
-  };
-  const response = await axios.post(url, data, {
-    headers: { "Content-Type": "application/json" },
-    timeout: 30000
-  });
-  pascaCache = response.data;
-  pascaCacheTime = Date.now();
-  return pascaCache;
-}
-
-// ============ CRON JOB - REFRESH PRICELIST OTOMATIS ============
-
-async function refreshAllCache() {
-  console.log("🔄 [Cron] Starting cache refresh...");
-
-  try {
-    prepaidCache = null;
-    prepaidCacheTime = 0;
-    pascaCache = null;
-    pascaCacheTime = 0;
-
-    const [prepaid, pasca] = await Promise.all([
-      getCachedPrepaid(),
-      getCachedPasca()
-    ]);
-
-    const prepaidCount = prepaid?.data?.length || 0;
-    const pascaCount = pasca?.data?.length || 0;
-
-    console.log(`✅ [Cron] Cache refreshed: ${prepaidCount} prepaid, ${pascaCount} pasca products`);
-    console.log(`   Updated at: ${new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })} WIB`);
-
-    await saveCacheToFirebase("prepaid", prepaid);
-    await saveCacheToFirebase("pasca", pasca);
-
-    return { prepaidCount, pascaCount, success: true };
-  } catch (error) {
-    console.error("❌ [Cron] Cache refresh failed:", error.message);
-    return { success: false, error: error.message };
-  }
-}
-
-async function saveCacheToFirebase(type, data) {
-  try {
-    const cacheRef = ref(database, `cache/pricelist/${type}`);
-    await set(cacheRef, {
-      data: data,
-      savedAt: Date.now(),
-      savedAtISO: new Date().toISOString()
+const digi = axios.create({
+  baseURL: "https://api.digiflazz.com/v1",
+  timeout: 30000,
+  headers: { "Content-Type": "application/json" }
+});
+digi.interceptors.request.use((cfg) => {
+  cfg.metadata = { start: Date.now() };
+  digiLog.debug(`→ POST ${cfg.url}`, { body: cfg.data });
+  return cfg;
+});
+digi.interceptors.response.use(
+  (res) => {
+    digiLog.debug(`← ${res.status} ${res.config.url} ${Date.now() - res.config.metadata.start}ms`, { body: res.data });
+    return res;
+  },
+  (err) => {
+    const cfg = err.config || {};
+    digiLog.warn(`← ERROR ${cfg.url} ${cfg.metadata ? Date.now() - cfg.metadata.start : "?"}ms`, {
+      code: err.code, status: err.response && err.response.status,
+      body: err.response && err.response.data, message: err.message
     });
-    console.log(`💾 [Cache] Saved ${type} pricelist to Firebase`);
-  } catch (err) {
-    console.error(`❌ [Cache] Failed to save ${type} to Firebase:`, err.message);
+    return Promise.reject(err);
   }
+);
+
+/* ============================================================
+ *  PRICELIST CACHE
+ * ============================================================ */
+const pl = {
+  prepaid: { list: null, ts: 0, inflight: null },
+  pasca: { list: null, ts: 0, inflight: null }
+};
+
+async function fetchPricelist(type) {
+  const res = await digi.post("/price-list", { cmd: type, username: CONFIG.digiUser, sign: sigPricelist() });
+  const list = res.data && res.data.data;
+  if (!Array.isArray(list)) {
+    // Digiflazz membalas error (mis. rate limit / IP ditolak) dalam objek, bukan array produk
+    const info = (list && typeof list === "object") ? list : res.data;
+    const e = new Error(`Pricelist ${type} bukan array. rc=${info && info.rc} message=${info && info.message}`);
+    e.digiflazz = info;
+    throw e;
+  }
+  return list;
+}
+
+function diffPricelist(oldList, newList) {
+  if (!Array.isArray(oldList)) return { firstLoad: true };
+  const om = new Map(oldList.map(p => [p.buyer_sku_code, p]));
+  const nm = new Map(newList.map(p => [p.buyer_sku_code, p]));
+  const added = [], removed = [], priceSamples = [];
+  let priceChanged = 0, statusChanged = 0;
+  for (const [sku, p] of nm) {
+    const o = om.get(sku);
+    if (!o) { added.push(sku); continue; }
+    if (Number(o.price) !== Number(p.price)) { priceChanged++; if (priceSamples.length < 10) priceSamples.push(`${sku}:${o.price}->${p.price}`); }
+    if (o.seller_product_status !== p.seller_product_status || o.buyer_product_status !== p.buyer_product_status) statusChanged++;
+  }
+  for (const sku of om.keys()) if (!nm.has(sku)) removed.push(sku);
+  return {
+    added: added.length, addedSample: added.slice(0, 20),
+    removed: removed.length, removedSample: removed.slice(0, 20),
+    priceChanged, priceSamples, statusChanged
+  };
+}
+
+async function saveCacheToFirebase(type, list) {
+  try {
+    await fbSet(`${DB.cache}/${type}`, { data: list, count: list.length, savedAt: Date.now(), savedAtISO: new Date().toISOString() });
+    cacheLog.info(`Pricelist ${type} disimpan ke Firebase`, { count: list.length });
+  } catch (e) { cacheLog.error(`Gagal simpan pricelist ${type} ke Firebase`, errMeta(e)); }
 }
 
 async function loadCacheFromFirebase() {
-  try {
-    console.log("📂 [Startup] Loading cache from Firebase...");
-    const [prepaidSnap, pascaSnap] = await Promise.all([
-      get(ref(database, "cache/pricelist/prepaid")),
-      get(ref(database, "cache/pricelist/pasca"))
-    ]);
-
-    if (prepaidSnap.exists()) {
-      const saved = prepaidSnap.val();
-      prepaidCache = saved.data;
-      prepaidCacheTime = saved.savedAt;
-      console.log(`📦 [Startup] Loaded prepaid from Firebase (${saved.data?.data?.length || 0} products, saved: ${saved.savedAtISO})`);
-    }
-
-    if (pascaSnap.exists()) {
-      const saved = pascaSnap.val();
-      pascaCache = saved.data;
-      pascaCacheTime = saved.savedAt;
-      console.log(`📦 [Startup] Loaded pasca from Firebase (${saved.data?.data?.length || 0} products, saved: ${saved.savedAtISO})`);
-    }
-
-    return true;
-  } catch (err) {
-    console.error("❌ [Startup] Failed to load cache from Firebase:", err.message);
-    return false;
+  cacheLog.info("Memuat cache pricelist dari Firebase...");
+  for (const t of ["prepaid", "pasca"]) {
+    try {
+      const snap = await fbGet(`${DB.cache}/${t}`);
+      if (!snap.exists()) { cacheLog.info(`Cache ${t} di Firebase kosong`); continue; }
+      const v = snap.val();
+      let list = v.data;
+      if (list && !Array.isArray(list) && typeof list === "object") list = Object.values(list);
+      if (Array.isArray(list) && list.length) {
+        pl[t].list = list; pl[t].ts = v.savedAt || 0;
+        cacheLog.info(`Cache ${t} dimuat dari Firebase`, { count: list.length, savedAt: v.savedAtISO });
+      }
+    } catch (e) { cacheLog.error(`Gagal memuat cache ${t}`, errMeta(e)); }
   }
 }
 
-cron.schedule("0 */2 * * *", async () => {
-  console.log("⏰ [Cron] Triggered: Every 2 hours refresh");
-  await refreshAllCache();
-}, {
-  timezone: "Asia/Jakarta"
-});
+function refreshPricelist(type, reason) {
+  const s = pl[type];
+  if (s.inflight) { cacheLog.debug(`Refresh ${type} sudah berjalan, menunggu hasilnya`); return s.inflight; }
+  s.inflight = (async () => {
+    const t = Date.now();
+    cacheLog.info(`Mengambil pricelist ${type} dari Digiflazz (${reason})`);
+    try {
+      const list = await fetchPricelist(type);
+      const diff = diffPricelist(s.list, list);
+      s.list = list; s.ts = Date.now();
+      cacheLog.info(`Pricelist ${type} diperbarui`, { count: list.length, ms: Date.now() - t, ...diff });
+      await saveCacheToFirebase(type, list);
+      return list;
+    } catch (e) {
+      cacheLog.error(`Refresh pricelist ${type} GAGAL (cache lama tetap dipakai)`, { ...errMeta(e), digiflazz: e.digiflazz });
+      throw e;
+    } finally { s.inflight = null; }
+  })();
+  return s.inflight;
+}
 
-cron.schedule("5 0 * * *", async () => {
-  console.log("🌙 [Cron] Triggered: Daily midnight refresh");
-  await refreshAllCache();
-}, {
-  timezone: "Asia/Jakarta"
-});
-
-// ============ STARTUP: Load cache dari Firebase ============
-(async () => {
-  await loadCacheFromFirebase();
-
-  const prepaidExpired = !prepaidCache || (Date.now() - prepaidCacheTime) > CACHE_TTL;
-  const pascaExpired = !pascaCache || (Date.now() - pascaCacheTime) > CACHE_TTL;
-
-  if (prepaidExpired || pascaExpired) {
-    console.log("🚀 [Startup] Cache expired or empty, fetching fresh data...");
-    await refreshAllCache();
-  } else {
-    console.log("✅ [Startup] Cache still valid, skipping fresh fetch.");
+async function getPricelist(type) {
+  const s = pl[type];
+  if (s.list && Date.now() - s.ts < CONFIG.cacheTtlMs) {
+    cacheLog.debug(`Cache hit ${type}`, { ageMin: Math.floor((Date.now() - s.ts) / 60000), count: s.list.length });
+    return s.list;
   }
-})();
-
-// ============ FUNGSI CEK STATUS TRANSAKSI ============
-
-async function checkTransactionStatus(postData) {
-  const url = "https://api.digiflazz.com/v1/transaction";
-  postData.sign = generateSignature(postData.ref_id);
-
-  try {
-    const response = await axios.post(url, postData, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 30000
-    });
-    return response.data;
-  } catch (error) {
-    // Digiflazz membalas 400 tapi body-nya tetap berisi status transaksi
-    if (error.response && error.response.data && error.response.data.data) {
-      return error.response.data;
-    }
-    throw new Error("Failed to check transaction status");
+  try { return await refreshPricelist(type, "cache-kedaluwarsa"); }
+  catch (e) {
+    if (s.list) { cacheLog.warn(`Menyajikan cache ${type} yang sudah basi`, { ageMin: Math.floor((Date.now() - s.ts) / 60000) }); return s.list; }
+    throw e;
   }
 }
 
-// ============ FUNGSI SIMPAN KE DATABASE (PATH GASKUY) ============
+async function refreshAll(reason) {
+  const [a, b] = await Promise.allSettled([refreshPricelist("prepaid", reason), refreshPricelist("pasca", reason)]);
+  const errors = [];
+  if (a.status === "rejected") errors.push(`prepaid: ${a.reason.message}`);
+  if (b.status === "rejected") errors.push(`pasca: ${b.reason.message}`);
+  return {
+    success: errors.length === 0,
+    prepaidCount: a.status === "fulfilled" ? a.value.length : (pl.prepaid.list || []).length,
+    pascaCount: b.status === "fulfilled" ? b.value.length : (pl.pasca.list || []).length,
+    errors
+  };
+}
 
-async function saveTransactionToDatabase(postData, result) {
+/* ============================================================
+ *  MARKUP, SALDO JAGEL, TRANSAKSI
+ * ============================================================ */
+async function getUserMarkup(user) {
+  const def = { admin_fee: CONFIG.defaultAdminFee, markup: 0 };
   try {
-    const customerName = postData.customer_name || postData.customerName || 'unknown';
-    const refId = postData.ref_id;
+    const snap = await fbGet(`${DB.users}/${safeKey(user)}/markup`);
+    if (!snap.exists()) return def;
+    const v = snap.val();
+    return { admin_fee: Number(v.admin_fee ?? def.admin_fee), markup: Number(v.markup || 0) };
+  } catch (_) { return def; }
+}
 
-    let path;
-    if (postData.commands === "pay-pasca" || postData.commands === "inq-pasca") {
-      path = `trxpascagaskuy/${customerName}/${refId}`;
-    } else {
-      path = `trxppobgaskuy/${customerName}/${refId}`;
-    }
+async function saldoApi(payload) {
+  const t = Date.now();
+  saldoLog.debug(`→ ${payload.action}`, { user: payload.value, amount: payload.amount });
+  try {
+    const r = await axios.post(CONFIG.saldoApiUrl, payload, { timeout: 20000, headers: { "Content-Type": "application/json" } });
+    saldoLog.info(`← ${payload.action} ${r.status} ${Date.now() - t}ms`, { body: r.data });
+    return r.data;
+  } catch (e) {
+    saldoLog.error(`${payload.action} gagal ${Date.now() - t}ms`, errMeta(e));
+    return { success: false, message: e.message };
+  }
+}
+const notifyUser = (user, content) => saldoApi({ action: "send_message", value: user, content });
 
-    const transactionRef = ref(database, path);
-    const transactionData = {
-      data: {
-        ...result.data,
-        product_name: postData.product_name || postData.buyer_sku_code,
-        buyer_sku_code: postData.buyer_sku_code,
-        customer_no: postData.customer_no,
+const trxPath = (kind, user, refId) => `${kind === "pasca" ? DB.trxPasca : DB.trxPrepaid}/${safeKey(user)}/${refId}`;
+
+async function saveTransaction(kind, user, refId, digiData, meta) {
+  try {
+    const record = {
+      data: clean({
+        ...(digiData || {}),
+        product_name: meta.product_name || meta.buyer_sku_code,
+        buyer_sku_code: meta.buyer_sku_code,
+        customer_no: meta.customer_no,
+        customer_name: user,
         ref_id: refId,
         webhook_updated: false,
-        application: "mudico"
-      },
+        balance_deducted: false,
+        application: CONFIG.appName
+      }),
       timestamp: Date.now(),
       date: new Date().toISOString()
     };
-
-    await set(transactionRef, transactionData);
-    console.log(`💾 [saveTransaction] Saved to Firebase: ${path}`);
+    await fbSet(trxPath(kind, user, refId), record);
+    await fbSet(`${DB.trxIndex}/${refId}`, { user: safeKey(user), kind, ts: Date.now() });
+    trxLog.info(`Transaksi ${refId} tersimpan`, { kind, user, status: record.data.status });
     return true;
-  } catch (error) {
-    console.error(`❌ [saveTransaction] Error saving to database:`, error.message);
+  } catch (e) {
+    trxLog.error(`GAGAL menyimpan transaksi ${refId} (perlu dicek manual)`, { kind, user, ...errMeta(e) });
     return false;
   }
 }
 
-async function savePascaTransactionToDatabase(customerName, refId, result, productName) {
+async function callTransaction(body) {
   try {
-    const transactionRef = ref(database, `trxpascagaskuy/${customerName}/${refId}`);
-    const transactionData = {
-      data: {
-        ...result.data,
-        product_name: productName,
-        webhook_updated: false,
-        application: "mudico"
-      },
-      timestamp: Date.now(),
-      date: new Date().toISOString()
-    };
-    await set(transactionRef, transactionData);
-    console.log(`💾 [savePascaTransaction] Saved to Firebase: trxpascagaskuy/${customerName}/${refId}`);
-    return true;
-  } catch (error) {
-    console.error(`❌ [savePascaTransaction] Error:`, error.message);
-    return false;
+    const r = await digi.post("/transaction", body);
+    return r.data;
+  } catch (e) {
+    if (e.response && e.response.data && e.response.data.data) return e.response.data; // penolakan Digiflazz (mis. RC 69)
+    if (!e.response) e.noResponse = true;                                              // timeout / jaringan putus
+    throw e;
   }
 }
 
-// Fungsi untuk menyimpan log webhook ke Firebase
-async function saveWebhookLogToFirebase(webhookData, headers, status, message) {
-  try {
-    const logRef = ref(database, `webhook_logs/${Date.now()}`);
-    const logEntry = {
-      timestamp: Date.now(),
-      date: new Date().toISOString(),
-      webhook_id: WEBHOOK_ID,
-      headers: {
-        'user-agent': headers['user-agent'],
-        'x-digiflazz-event': headers['x-digiflazz-event'],
-        'x-hub-signature': headers['x-hub-signature'] ? 'present' : 'missing'
-      },
-      payload: webhookData,
-      processing_status: status,
-      processing_message: message,
-      ip: headers['x-forwarded-for'] || headers['host'],
-      application: "mudico"
-    };
-    await set(logRef, logEntry);
-    console.log(`💾 [Webhook] Log saved to Firebase with key: ${logRef.key}`);
-    return true;
-  } catch (error) {
-    console.error(`❌ [Webhook] Failed to save log to Firebase:`, error.message);
-    return false;
-  }
+function logTrxResult(kind, refId, user, sku, result) {
+  const d = (result && result.data) || {};
+  const meta = { kind, user, sku, customer_no: d.customer_no, rc: d.rc, message: d.message, price: d.price, sn: d.sn };
+  if (d.status === "Sukses") trxLog.info(`Transaksi ${refId} SUKSES (saldo dipotong oleh frontend)`, meta);
+  else if (d.status === "Pending") trxLog.info(`Transaksi ${refId} PENDING, menunggu webhook`, meta);
+  else trxLog.warn(`Transaksi ${refId} GAGAL`, meta);
 }
 
-async function updateTransactionViaWebhook(refId, webhookData, isPrepaid = true) {
-  try {
-    console.log(`🔄 [Webhook] Updating transaction ${refId} from webhook`);
-    console.log(`   Webhook ID: ${WEBHOOK_ID}`);
-    console.log(`   Application: MUDICO`);
+/* ============================================================
+ *  EXPRESS APP + MIDDLEWARE
+ * ============================================================ */
+const app = express();
+app.set("trust proxy", true);
+app.use(cors());
+app.use(express.json({ limit: "2mb", verify: (req, res, buf) => { req.rawBody = buf; } }));
+app.use(express.urlencoded({ extended: true }));
 
-    const prepaidRef = ref(database, `trxppobgaskuy`);
-    const pascaRef = ref(database, `trxpascagaskuy`);
+app.use((req, res, next) => {
+  const reqId = crypto.randomBytes(3).toString("hex");
+  const start = Date.now();
+  res.setHeader("X-Request-Id", reqId);
+  const url = req.originalUrl.replace(/([?&]secret=)[^&]*/gi, "$1***");
+  const hasBody = req.body && Object.keys(req.body).length > 0;
 
-    let transactionPath = null;
-    let customerName = null;
-
-    // Cari di prepaid transactions
-    const prepaidSnapshot = await get(prepaidRef);
-    if (prepaidSnapshot.exists()) {
-      const prepaidData = prepaidSnapshot.val();
-      for (const [user, transactions] of Object.entries(prepaidData)) {
-        if (transactions[refId]) {
-          transactionPath = `trxppobgaskuy/${user}/${refId}`;
-          customerName = user;
-          break;
-        }
-      }
-    }
-
-    // Jika tidak ditemukan, cari di pasca transactions
-    if (!transactionPath) {
-      const pascaSnapshot = await get(pascaRef);
-      if (pascaSnapshot.exists()) {
-        const pascaData = pascaSnapshot.val();
-        for (const [user, transactions] of Object.entries(pascaData)) {
-          if (transactions[refId]) {
-            transactionPath = `trxpascagaskuy/${user}/${refId}`;
-            customerName = user;
-            break;
-          }
-        }
-      }
-    }
-
-    if (transactionPath && customerName) {
-      const transactionRef = ref(database, transactionPath);
-      const snapshot = await get(transactionRef);
-
-      if (snapshot.exists()) {
-        const existingData = snapshot.val();
-        const updatedData = {
-          ...existingData,
-          data: {
-            ...existingData.data,
-            ...webhookData.data,
-            status: webhookData.data?.status || existingData.data?.status,
-            sn: webhookData.data?.sn || existingData.data?.sn,
-            message: webhookData.data?.message || existingData.data?.message,
-            rc: webhookData.data?.rc || existingData.data?.rc,
-            webhook_updated: true,
-            webhook_updated_at: Date.now(),
-            webhook_id: WEBHOOK_ID,
-            application: "mudico"
-          },
-          webhook_last_update: new Date().toISOString(),
-          webhook_source: "digiflazz"
-        };
-
-        await set(transactionRef, updatedData);
-        console.log(`✅ [Webhook] Updated transaction ${refId} for user ${customerName}`);
-        console.log(`   New status: ${webhookData.data?.status}`);
-
-        // Update saldo user jika status Sukses dan sebelumnya belum diupdate
-        if (webhookData.data?.status === "Sukses" && existingData.data?.status !== "Sukses") {
-          const sellingPrice = webhookData.data?.selling_price || webhookData.data?.price;
-          if (sellingPrice && customerName) {
-            await updateUserBalance(customerName, -sellingPrice);
-            console.log(`💰 [Webhook] Updated balance for ${customerName}: -${sellingPrice}`);
-          }
-        }
-
-        return { success: true, customerName, oldStatus: existingData.data?.status, newStatus: webhookData.data?.status };
-      }
-    }
-
-    console.log(`⚠️ [Webhook] Transaction ${refId} not found in database`);
-    return { success: false, error: "Transaction not found" };
-  } catch (error) {
-    console.error(`❌ [Webhook] Error updating transaction:`, error.message);
-    return { success: false, error: error.message };
-  }
-}
-
-async function updateUserBalance(username, amount) {
-  try {
-    const formdata = new FormData();
-    formdata.append("amount", amount);
-    formdata.append("username", username);
-    formdata.append("app", "mudico");
-
-    const config = {
-      method: "post",
-      url: "https://gaskuy.my.id/pulsa.php",
-      headers: { ...formdata.getHeaders() },
-      data: formdata,
-    };
-
-    const response = await axios(config);
-    console.log(`💰 [updateBalance] Updated balance for ${username}: ${amount}`);
-    console.log(`   Response:`, response.data);
-    return response.data;
-  } catch (error) {
-    console.error(`❌ [updateBalance] Error:`, error.message);
-    return { error: error.message };
-  }
-}
-
-// ============ WEBHOOK ENDPOINT ============
-
-app.post("/webhook/digiflazz", async (req, res) => {
-  const startTime = Date.now();
-  console.log(`📨 [Webhook] Received webhook from Digiflazz`);
-  console.log(`   Webhook ID: ${WEBHOOK_ID}`);
-  console.log(`   Application: MUDICO`);
-  console.log(`   Time: ${new Date().toISOString()}`);
-  console.log(`   Headers:`, req.headers);
-  console.log(`   Body:`, JSON.stringify(req.body, null, 2));
-
-  const webhookData = req.body;
-  const headers = req.headers;
-  const userAgent = headers['user-agent'];
-  const digiflazzEvent = headers['x-digiflazz-event'];
-  const hubSignature = headers['x-hub-signature'];
-
-  let responseStatus = 200;
-  let responseMessage = "Webhook processed successfully";
-  let verificationStatus = "unknown";
-
-  // Verifikasi signature
-  if (WEBHOOK_SECRET && hubSignature) {
-    const rawBody = JSON.stringify(req.body);
-    const expectedSignature = 'sha1=' + crypto.createHmac('sha1', WEBHOOK_SECRET).update(rawBody).digest('hex');
-
-    if (hubSignature !== expectedSignature) {
-      console.error(`❌ [Webhook] Invalid signature!`);
-      verificationStatus = "failed";
-      responseStatus = 401;
-      responseMessage = "Invalid signature";
-
-      await saveWebhookLogToFirebase(webhookData, headers, "failed", "Invalid signature");
-      return res.status(401).json({ error: "Invalid signature", webhook_id: WEBHOOK_ID });
-    }
-    verificationStatus = "success";
-    console.log(`✅ [Webhook] Signature verified`);
-  }
-
-  let transactionType = "unknown";
-  if (userAgent === "Digiflazz-Hookshot") {
-    transactionType = "prepaid";
-    console.log(`📱 [Webhook] Prepaid transaction detected`);
-  } else if (userAgent === "Digiflazz-Pasca-Hookshot") {
-    transactionType = "postpaid";
-    console.log(`📄 [Webhook] Postpaid transaction detected`);
-  }
-
-  console.log(`🎯 [Webhook] Event: ${digiflazzEvent}`);
-
-  let updateResult = { success: false };
-
-  if (webhookData.data && webhookData.data.ref_id) {
-    const refId = webhookData.data.ref_id;
-    const status = webhookData.data.status;
-    console.log(`🆔 [Webhook] Ref ID: ${refId}, Status: ${status}`);
-
-    try {
-      updateResult = await updateTransactionViaWebhook(refId, webhookData, transactionType === "prepaid");
-      responseMessage = updateResult.success
-        ? `Transaction ${refId} updated from ${updateResult.oldStatus || 'unknown'} to ${updateResult.newStatus || status}`
-        : `Webhook received but transaction ${refId} not found`;
-    } catch (error) {
-      console.error(`❌ [Webhook] Error processing:`, error);
-      responseStatus = 500;
-      responseMessage = "Internal server error";
-    }
-  } else {
-    responseMessage = "Received but no ref_id";
-    if (webhookData.sed && webhookData.hook_id) {
-      console.log(`🏓 [Webhook] Ping event received!`);
-      responseMessage = "Ping event received";
-    }
-  }
-
-  await saveWebhookLogToFirebase(webhookData, headers, updateResult.success ? "success" : "warning", responseMessage);
-
-  const processingTime = Date.now() - startTime;
-  console.log(`⏱️ [Webhook] Processing time: ${processingTime}ms`);
-
-  res.status(responseStatus).json({
-    success: updateResult.success,
-    message: responseMessage,
-    webhook_id: WEBHOOK_ID,
-    application: "mudico",
-    ref_id: webhookData.data?.ref_id || null,
-    status: webhookData.data?.status || null,
-    processing_time_ms: processingTime,
-    verification: verificationStatus
+  als.run({ reqId }, () => {
+    httpLog.info(`→ ${req.method} ${url}`, { ip: req.ip, ua: (req.headers["user-agent"] || "").slice(0, 80), body: hasBody ? req.body : undefined });
   });
-});
 
-app.post("/webhook/ping", async (req, res) => {
-  console.log(`🏓 [Webhook-Ping] Received ping from Digiflazz`);
-  await saveWebhookLogToFirebase(req.body, req.headers, "ping", "Ping event received");
-  res.status(200).json({ success: true, message: "Pong! Webhook is active", webhook_id: WEBHOOK_ID, application: "mudico" });
-});
+  const origJson = res.json.bind(res);
+  res.json = (body) => { res.locals.respBody = body; return origJson(body); };
 
-app.get("/webhook/test-ping", async (req, res) => {
-  console.log(`🔧 [Webhook] Testing ping to Digiflazz webhook ${WEBHOOK_ID}`);
-  try {
-    const response = await axios.post(`https://api.digiflazz.com/v1/report/hooks/${WEBHOOK_ID}/pings`, {});
-    res.json({ success: true, message: "Ping sent successfully", webhook_id: WEBHOOK_ID, application: "mudico", response: response.data });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message, webhook_id: WEBHOOK_ID });
-  }
-});
-
-app.get("/webhook/logs", async (req, res) => {
-  try {
-    const { limit = 50 } = req.query;
-    const logsRef = ref(database, `webhook_logs`);
-    const snapshot = await get(logsRef);
-    let logs = [];
-    if (snapshot.exists()) {
-      const data = snapshot.val();
-      logs = Object.entries(data).map(([key, value]) => ({ id: key, ...value }))
-        .sort((a, b) => b.timestamp - a.timestamp).slice(0, parseInt(limit));
-    }
-    res.json({ success: true, webhook_id: WEBHOOK_ID, application: "mudico", total_logs: logs.length, logs: logs });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/webhook/stats", async (req, res) => {
-  try {
-    const logsRef = ref(database, `webhook_logs`);
-    const snapshot = await get(logsRef);
-    let stats = { total: 0, success: 0, warning: 0, failed: 0, ping: 0, last_24h: 0 };
-    const last24h = Date.now() - (24 * 60 * 60 * 1000);
-    if (snapshot.exists()) {
-      const data = snapshot.val();
-      stats.total = Object.keys(data).length;
-      Object.values(data).forEach(log => {
-        if (log.processing_status === "success") stats.success++;
-        if (log.processing_status === "warning") stats.warning++;
-        if (log.processing_status === "failed") stats.failed++;
-        if (log.processing_status === "ping") stats.ping++;
-        if (log.timestamp > last24h) stats.last_24h++;
-      });
-    }
-    res.json({ success: true, webhook_id: WEBHOOK_ID, application: "mudico", stats: stats, server_time: new Date().toISOString() });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-app.get("/webhook/info", (req, res) => {
-  res.json({
-    webhook_id: WEBHOOK_ID,
-    application: "mudico",
-    firebase_paths: "gaskuy (trxppobgaskuy, trxpascagaskuy, cache/pricelist, webhook_logs)",
-    endpoints: {
-      main: "/webhook/digiflazz",
-      ping: "/webhook/ping",
-      logs: "/webhook/logs",
-      stats: "/webhook/stats",
-      test_ping: "/webhook/test-ping"
-    },
-    status: "active",
-    mode: "WEBHOOK ONLY (No Polling)",
-    config: {
-      has_secret: !!WEBHOOK_SECRET,
-      secret_type: "letters_numbers_spaces",
-      supported_events: ["create", "update"],
-      supported_transactions: ["prepaid", "postpaid"]
-    }
+  res.on("finish", () => {
+    als.run({ reqId }, () => {
+      const ms = Date.now() - start;
+      const lvl = res.statusCode >= 500 ? "error" : res.statusCode >= 400 ? "warn" : "info";
+      httpLog[lvl](`← ${req.method} ${url} ${res.statusCode} ${ms}ms`, { resp: summarizeBody(res.locals.respBody) });
+    });
   });
+  als.run({ reqId }, () => next());
 });
 
-// ============ ENDPOINTS ============
+const sha = (s) => crypto.createHash("sha256").update(String(s)).digest();
+const safeEqual = (a, b) => crypto.timingSafeEqual(sha(a), sha(b));
 
+function adminAuth(req, res, next) {
+  if (!CONFIG.adminSecret) return res.status(503).json({ success: false, error: "ADMIN_SECRET belum di-set" });
+  const provided = req.headers["x-admin-secret"] || (req.body && req.body.secret) || req.query.secret || "";
+  if (!safeEqual(provided, CONFIG.adminSecret)) {
+    log.warn("Autentikasi admin gagal", { path: req.path, ip: req.ip });
+    return res.status(403).json({ success: false, error: "Unauthorized" });
+  }
+  next();
+}
+
+/* ============================================================
+ *  ENDPOINT PUBLIK (dipakai frontend)
+ * ============================================================ */
+app.get("/health", (req, res) => res.json({ ok: true, app: CONFIG.appName, uptimeSec: Math.floor(process.uptime()), time: new Date().toISOString() }));
+
+// Catatan: ini menampilkan saldo deposit akun Digiflazz Anda. Sebaiknya jangan dipanggil dari frontend.
 app.post("/balance", async (req, res) => {
-  console.log(`📥 [balance] Request received - MUDICO`);
-  const url = "https://api.digiflazz.com/v1/cek-saldo";
-  const signature = crypto.createHash('md5').update(username + apiKey + "depo").digest('hex');
-  const data = { cmd: "deposit", username: username, sign: signature };
   try {
-    const response = await axios.post(url, data, { headers: { "Content-Type": "application/json" }, timeout: 30000 });
-    res.json(response.data);
-  } catch (error) {
+    const r = await digi.post("/cek-saldo", { cmd: "deposit", username: CONFIG.digiUser, sign: sigDeposit() });
+    res.json(r.data);
+  } catch (e) {
+    log.error("Cek saldo Digiflazz gagal", errMeta(e));
     res.status(500).json({ error: "Gagal memproses data" });
   }
 });
 
 app.post("/post-request", async (req, res) => {
-  console.log(`📥 [post-request] Request received - MUDICO`);
-  try {
-    const cachedData = await getCachedPrepaid();
-    res.json(cachedData);
-  } catch (error) {
-    res.status(500).json({ error: "Tidak ada koneksi Internet" });
-  }
+  try { res.json({ data: await getPricelist("prepaid") }); }
+  catch (e) { log.error("Pricelist prepaid tidak tersedia", { ...errMeta(e), digiflazz: e.digiflazz }); res.status(500).json({ error: "Daftar produk tidak tersedia" }); }
 });
 
 app.post("/post-pasca", async (req, res) => {
-  console.log(`📥 [post-pasca] Request received - MUDICO`);
-  try {
-    const cachedData = await getCachedPasca();
-    res.json(cachedData);
-  } catch (error) {
-    res.status(500).json({ error: "Tidak ada koneksi Internet" });
-  }
+  try { res.json({ data: await getPricelist("pasca") }); }
+  catch (e) { log.error("Pricelist pasca tidak tersedia", { ...errMeta(e), digiflazz: e.digiflazz }); res.status(500).json({ error: "Daftar produk tidak tersedia" }); }
 });
-
-// ============ TRANSACTION PREPAID (WEBHOOK ONLY - NO POLLING) ============
-app.post("/transaction", async (req, res) => {
-  console.log(`📥 [transaction] Request received - MUDICO (Webhook Only Mode - No Polling)`);
-  console.log(`   Body:`, req.body);
-
-  const ref_id = shortid.generate();
-  const sign = generateSignature(ref_id);
-
-  const postData = {
-    username: username,
-    buyer_sku_code: req.body.buyer_sku_code,
-    customer_no: req.body.customer_no,
-    ref_id: ref_id,
-    sign: sign,
-    customer_name: req.body.customer_name,
-    product_name: req.body.product_name || req.body.buyer_sku_code
-  };
-
-  console.log(`   Ref ID: ${ref_id}`);
-  console.log(`   Customer: ${postData.customer_name}`);
-
-  try {
-    const responseData = await checkTransactionStatus(postData);
-    console.log(`   Initial status: ${responseData.data?.status}`);
-
-    // Simpan transaksi ke database terlebih dahulu
-    await saveTransactionToDatabase(postData, responseData);
-
-    // Jika langsung Sukses, update saldo
-    if (responseData.data && responseData.data.status === "Sukses") {
-      console.log(`✅ [transaction] Transaction ${ref_id} langsung sukses`);
-      if (responseData.data.selling_price) {
-        await updateUserBalance(req.body.customer_name, -responseData.data.selling_price);
-      }
-      return res.json(responseData);
-    }
-
-    // Jika Pending, response cepat - biarkan webhook yang update
-    if (responseData.data && responseData.data.status === "Pending") {
-      console.log(`⏳ [transaction] Transaction ${ref_id} pending, menunggu webhook dari Digiflazz`);
-      return res.json({
-        success: true,
-        message: "Transaksi sedang diproses, akan diupdate secara real-time via webhook",
-        ref_id: ref_id,
-        status: "Pending",
-        application: "mudico",
-        note: "Status akan terupdate otomatis dalam beberapa detik"
-      });
-    }
-
-    // Jika Gagal
-    res.json(responseData);
-
-  } catch (error) {
-    console.error("❌ [transaction] Error:", error);
-    res.status(500).json({ error: "Internal Server Error" });
-  }
-});
-
-// ============ TRANSACTION POSTPAID (WEBHOOK ONLY - NO POLLING) ============
-let temporaryRefId = null;
-let temporaryData = {};
-
-app.post("/inqpasca", async (req, res) => {
-  console.log(`📥 [inqpasca] Request received - MUDICO`);
-  const ref_id = shortid.generate();
-  const sign = generateSignature(ref_id);
-
-  let postData = {
-    commands: "inq-pasca",
-    username: username,
-    buyer_sku_code: req.body.buyer_sku_code,
-    customer_no: req.body.customer_no,
-    ref_id: ref_id,
-    sign: sign
-  };
-
-  if (req.body.amount && parseInt(req.body.amount) > 0) {
-    postData.amount = parseInt(req.body.amount);
-  }
-
-  try {
-    const response = await axios.post("https://api.digiflazz.com/v1/transaction", postData, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 30000
-    });
-
-    temporaryRefId = ref_id;
-    temporaryData[ref_id] = {
-      buyer_sku_code: req.body.buyer_sku_code,
-      customer_no: req.body.customer_no,
-      customer_name: req.body.customer_name,
-      amount: req.body.amount || null
-    };
-
-    res.status(200).json(response.data);
-  } catch (error) {
-    if (error.response) {
-      res.status(error.response.status).json(error.response.data);
-    } else {
-      res.status(500).json({ error: error.message });
-    }
-  }
-});
-
-app.post("/transactionpasca", async (req, res) => {
-  console.log(`📥 [transactionpasca] Request received - MUDICO (Webhook Only Mode - No Polling)`);
-  console.log(`   Body:`, req.body);
-
-  let ref_id = temporaryRefId;
-  if (!ref_id) {
-    ref_id = shortid.generate();
-    console.log(`   ⚠️ No ref_id found, generating new: ${ref_id}`);
-  }
-
-  const sign = generateSignature(ref_id);
-
-  let postData = {
-    commands: "pay-pasca",
-    username: username,
-    buyer_sku_code: req.body.buyer_sku_code,
-    customer_no: req.body.customer_no,
-    ref_id: ref_id,
-    sign: sign,
-    customer_name: req.body.customer_name
-  };
-
-  if (temporaryData[ref_id] && temporaryData[ref_id].amount) {
-    postData.amount = temporaryData[ref_id].amount;
-  }
-  if (req.body.amount && parseInt(req.body.amount) > 0) {
-    postData.amount = parseInt(req.body.amount);
-  }
-
-  console.log(`   Customer: ${postData.customer_name}`);
-  console.log(`   Ref ID: ${ref_id}`);
-
-  try {
-    const responseData = await checkTransactionStatus(postData);
-    console.log(`   Initial status: ${responseData.data?.status}`);
-
-    // Simpan transaksi ke database
-    await savePascaTransactionToDatabase(req.body.customer_name, ref_id, responseData, req.body.buyer_sku_code);
-
-    // Jika langsung Sukses
-    if (responseData.data && responseData.data.status === "Sukses") {
-      console.log(`✅ [transactionpasca] Transaction ${ref_id} langsung sukses`);
-      if (responseData.data.selling_price) {
-        await updateUserBalance(req.body.customer_name, -responseData.data.selling_price);
-      }
-      res.json(responseData);
-    }
-    // Jika Pending - biarkan webhook update
-    else if (responseData.data && responseData.data.status === "Pending") {
-      console.log(`⏳ [transactionpasca] Transaction ${ref_id} pending, menunggu webhook`);
-      res.json({
-        success: true,
-        message: "Transaksi sedang diproses, akan diupdate secara real-time via webhook",
-        ref_id: ref_id,
-        status: "Pending",
-        application: "mudico",
-        note: "Status akan terupdate otomatis dalam beberapa detik"
-      });
-    } else {
-      res.json(responseData);
-    }
-  } catch (error) {
-    console.error("❌ [transactionpasca] Error:", error);
-    res.status(500).json({ error: "Internal Server Error" });
-  } finally {
-    if (ref_id) delete temporaryData[ref_id];
-    temporaryRefId = null;
-  }
-});
-
-// ============ ENDPOINTS LAINNYA ============
 
 app.post("/get-markup", async (req, res) => {
+  const user = req.body && req.body.username;
   try {
-    const { username } = req.body;
-    const markupRef = ref(database, `users/${username}/markup`);
-    const snapshot = await get(markupRef);
-    let markupData = { admin_fee: 650, markup: 0 };
-    if (snapshot.exists()) markupData = snapshot.val();
-    res.json({ success: true, ...markupData });
-  } catch (error) {
-    res.json({ success: false, admin_fee: 500, markup: 0 });
+    const m = await getUserMarkup(user);
+    res.json({ success: true, ...m });
+  } catch (e) {
+    res.json({ success: false, admin_fee: CONFIG.defaultAdminFee, markup: 0 });
   }
 });
 
 app.post("/inquiry-pln", async (req, res) => {
-  console.log(`📥 [inquiry-pln] Request received - MUDICO`);
-  const { customer_no } = req.body;
-  if (!customer_no) return res.status(400).json({ error: "customer_no wajib diisi" });
+  const { customer_no } = req.body || {};
+  if (!customer_no) return res.status(400).json({ success: false, error: "customer_no wajib diisi" });
+  try {
+    const r = await digi.post("/inquiry-pln", {
+      username: CONFIG.digiUser, customer_no, sign: md5(CONFIG.digiUser + CONFIG.digiKey + customer_no)
+    });
+    const d = r.data && r.data.data;
+    if (!d) { log.warn("Inquiry PLN tanpa data", { body: r.data }); return res.json({ success: false, message: "Gagal mendapatkan informasi pelanggan" }); }
+    trxLog.info("Inquiry PLN", { customer_no, status: d.status, rc: d.rc });
+    res.json({
+      success: true,
+      data: {
+        message: d.message, status: d.status, rc: d.rc, customer_no: d.customer_no,
+        meter_no: d.meter_no, subscriber_id: d.subscriber_id, name: d.name, segment_power: d.segment_power
+      }
+    });
+  } catch (e) {
+    log.error("Inquiry PLN gagal", errMeta(e));
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
 
-  const sign = CryptoJS.MD5(username + apiKey + customer_no).toString();
-  const postData = { username: username, customer_no: customer_no, sign: sign };
+/* ---------- PREPAID ---------- */
+app.post("/transaction", async (req, res) => {
+  const b = req.body || {};
+  const { buyer_sku_code, customer_no, customer_name } = b;
+  if (!buyer_sku_code || !customer_no || !customer_name) {
+    trxLog.warn("Parameter transaksi tidak lengkap", { body: b });
+    return res.status(400).json({ success: false, error: "Parameter tidak lengkap", data: { status: "Gagal", message: "buyer_sku_code, customer_no, dan customer_name wajib diisi" } });
+  }
+
+  const refId = shortid.generate();
+  trxLog.info(`Transaksi prepaid dimulai ${refId}`, { user: customer_name, sku: buyer_sku_code, customer_no, product: b.product_name, price_sell: b.price_sell });
+
+  // Bandingkan dengan pricelist (hanya log, tidak memblokir)
+  const item = (pl.prepaid.list || []).find(p => p.buyer_sku_code === buyer_sku_code);
+  if (!item) trxLog.warn(`SKU ${buyer_sku_code} tidak ada di cache pricelist`);
+  else {
+    trxLog.debug("Data produk di cache", { price: item.price, buyer_status: item.buyer_product_status, seller_status: item.seller_product_status });
+    if (Number(item.price) !== Number(b.price_sell)) trxLog.warn("Harga dari frontend berbeda dengan cache", { sent: b.price_sell, cache: item.price });
+    if (item.buyer_product_status === false || item.seller_product_status === false) trxLog.warn(`Produk ${buyer_sku_code} sedang nonaktif di pricelist`);
+  }
+
+  const postData = { username: CONFIG.digiUser, buyer_sku_code, customer_no, ref_id: refId, sign: sigTrx(refId) };
+  const meta = { buyer_sku_code, customer_no, product_name: b.product_name };
 
   try {
-    const response = await axios.post("https://api.digiflazz.com/v1/inquiry-pln", postData, {
-      headers: { "Content-Type": "application/json" },
-      timeout: 30000
+    const result = await callTransaction(postData);
+    await saveTransaction("prepaid", customer_name, refId, result.data, meta);
+    logTrxResult("prepaid", refId, customer_name, buyer_sku_code, result);
+    return res.json({ ...result, ref_id: refId });
+  } catch (e) {
+    if (e.noResponse) {
+      // Digiflazz mungkin sudah memproses. Jangan dianggap gagal: tandai Pending, biarkan webhook yang menyelesaikan.
+      trxLog.error(`Transaksi ${refId} TIMEOUT/tanpa respons, ditandai Pending`, errMeta(e));
+      const fake = { status: "Pending", message: "Tidak ada respons dari provider, menunggu konfirmasi", rc: "99", ref_id: refId, customer_no, buyer_sku_code };
+      await saveTransaction("prepaid", customer_name, refId, fake, meta);
+      return res.json({ data: fake, ref_id: refId });
+    }
+    trxLog.error(`Transaksi ${refId} ditolak/gagal`, errMeta(e));
+    return res.status(500).json({ success: false, error: "Internal Server Error", data: { status: "Gagal", message: "Transaksi tidak dapat diproses saat ini" } });
+  }
+});
+
+/* ---------- PASCABAYAR / E-MONEY ---------- */
+const inquiryStore = new Map();              // ref_id inquiry harus dipakai lagi saat bayar
+const INQ_TTL = 30 * 60 * 1000;
+const inqKey = (u, sku, no) => `${u || ""}|${sku}|${no}`;
+setInterval(() => {
+  const now = Date.now();
+  for (const [k, v] of inquiryStore) if (now - v.ts > INQ_TTL) inquiryStore.delete(k);
+}, 5 * 60 * 1000).unref();
+
+app.post("/inqpasca", async (req, res) => {
+  const { buyer_sku_code, customer_no, customer_name, amount } = req.body || {};
+  if (!buyer_sku_code || !customer_no) return res.status(400).json({ data: { status: "Gagal", message: "buyer_sku_code dan customer_no wajib diisi" } });
+
+  const refId = shortid.generate();
+  const postData = { commands: "inq-pasca", username: CONFIG.digiUser, buyer_sku_code, customer_no, ref_id: refId, sign: sigTrx(refId) };
+  const amt = parseInt(amount, 10);
+  if (amt > 0) postData.amount = amt;
+
+  trxLog.info(`Inquiry pasca ${refId}`, { user: customer_name, sku: buyer_sku_code, customer_no, amount: amt > 0 ? amt : undefined });
+  try {
+    const r = await digi.post("/transaction", postData);
+    inquiryStore.set(inqKey(customer_name, buyer_sku_code, customer_no), { ref_id: refId, amount: amt > 0 ? amt : null, ts: Date.now() });
+    const d = r.data && r.data.data;
+    trxLog.info(`Inquiry pasca ${refId} selesai`, { status: d && d.status, rc: d && d.rc, message: d && d.message, price: d && d.price });
+    return res.status(200).json(r.data);
+  } catch (e) {
+    if (e.response) return res.status(e.response.status).json(e.response.data);
+    return res.status(500).json({ error: e.message, data: { status: "Gagal", message: "Tidak dapat menghubungi provider" } });
+  }
+});
+
+app.post("/transactionpasca", async (req, res) => {
+  const b = req.body || {};
+  const { buyer_sku_code, customer_no, customer_name } = b;
+  if (!buyer_sku_code || !customer_no || !customer_name) {
+    trxLog.warn("Parameter transaksi pasca tidak lengkap", { body: b });
+    return res.status(400).json({ success: false, error: "Parameter tidak lengkap", data: { status: "Gagal", message: "buyer_sku_code, customer_no, dan customer_name wajib diisi" } });
+  }
+
+  const key = inqKey(customer_name, buyer_sku_code, customer_no);
+  const inq = inquiryStore.get(key);
+  let refId;
+  if (inq) refId = inq.ref_id;
+  else { refId = shortid.generate(); trxLog.warn(`Tidak ada inquiry sebelumnya untuk ${key}, membuat ref_id baru ${refId} (kemungkinan ditolak Digiflazz)`); }
+
+  const postData = { commands: "pay-pasca", username: CONFIG.digiUser, buyer_sku_code, customer_no, ref_id: refId, sign: sigTrx(refId) };
+  const amt = parseInt(b.amount, 10) > 0 ? parseInt(b.amount, 10) : (inq && inq.amount);
+  if (amt) postData.amount = amt;
+
+  trxLog.info(`Transaksi pasca dimulai ${refId}`, { user: customer_name, sku: buyer_sku_code, customer_no, amount: amt || undefined, usedInquiry: !!inq });
+  const meta = { buyer_sku_code, customer_no, product_name: b.product_name || buyer_sku_code };
+
+  try {
+    const result = await callTransaction(postData);
+    await saveTransaction("pasca", customer_name, refId, result.data, meta);
+    logTrxResult("pasca", refId, customer_name, buyer_sku_code, result);
+    inquiryStore.delete(key);
+    return res.json({ ...result, ref_id: refId });
+  } catch (e) {
+    if (e.noResponse) {
+      trxLog.error(`Transaksi pasca ${refId} TIMEOUT/tanpa respons, ditandai Pending`, errMeta(e));
+      const fake = { status: "Pending", message: "Tidak ada respons dari provider, menunggu konfirmasi", rc: "99", ref_id: refId, customer_no, buyer_sku_code };
+      await saveTransaction("pasca", customer_name, refId, fake, meta);
+      return res.json({ data: fake, ref_id: refId });
+    }
+    trxLog.error(`Transaksi pasca ${refId} ditolak/gagal`, errMeta(e));
+    return res.status(500).json({ success: false, error: "Internal Server Error", data: { status: "Gagal", message: "Transaksi tidak dapat diproses saat ini" } });
+  }
+});
+
+/* ---------- RIWAYAT ---------- */
+app.post("/api/history", async (req, res) => {
+  const { username, limit = 50 } = req.body || {};
+  if (!username) return res.status(400).json({ success: false, error: "Username required" });
+  try {
+    const [a, b] = await Promise.all([
+      fbGet(`${DB.trxPrepaid}/${safeKey(username)}`),
+      fbGet(`${DB.trxPasca}/${safeKey(username)}`)
+    ]);
+    const rows = [];
+    for (const snap of [a, b]) {
+      if (!snap.exists()) continue;
+      for (const [refId, item] of Object.entries(snap.val())) {
+        const d = item.data || {};
+        rows.push({
+          product_name: d.product_name || d.buyer_sku_code || "-",
+          customer_no: d.customer_no || "-",
+          price_sell: d.price || d.selling_price || 0,
+          status: d.status || "Unknown",
+          created_at: item.date || new Date(item.timestamp).toISOString(),
+          sn: d.sn || null,
+          sku_code: d.buyer_sku_code || null,
+          ref_id: refId,
+          webhook_updated: d.webhook_updated || false,
+          application: d.application || CONFIG.appName
+        });
+      }
+    }
+    rows.sort((x, y) => new Date(y.created_at) - new Date(x.created_at));
+    res.json({ success: true, data: limit > 0 ? rows.slice(0, limit) : rows });
+  } catch (e) {
+    log.error("Ambil riwayat gagal", errMeta(e));
+    res.status(500).json({ success: false, error: e.message });
+  }
+});
+
+/* ============================================================
+ *  WEBHOOK DIGIFLAZZ
+ * ============================================================ */
+async function findTransaction(refId) {
+  const idx = await fbGet(`${DB.trxIndex}/${refId}`);
+  if (idx.exists()) {
+    const v = idx.val();
+    return { kind: v.kind, user: v.user, path: trxPath(v.kind, v.user, refId) };
+  }
+  hookLog.warn(`Indeks transaksi ${refId} tidak ada, memindai seluruh data (lambat)`);
+  for (const kind of ["prepaid", "pasca"]) {
+    const snap = await fbGet(kind === "pasca" ? DB.trxPasca : DB.trxPrepaid);
+    if (!snap.exists()) continue;
+    for (const [user, trxs] of Object.entries(snap.val())) {
+      if (trxs && trxs[refId]) return { kind, user, path: trxPath(kind, user, refId) };
+    }
+  }
+  return null;
+}
+
+const deductLocks = new Set();
+
+async function lateDeduct(loc, refId, existing, wd) {
+  if (!CONFIG.lateDeduct) { hookLog.info(`Potong saldo dilewati (LATE_DEDUCT=false) untuk ${refId}`); return { skipped: "disabled" }; }
+  if (existing.data && existing.data.balance_deducted) { hookLog.info(`Saldo ${refId} sudah pernah dipotong`); return { skipped: "already" }; }
+  if (deductLocks.has(refId)) { hookLog.warn(`Pemotongan ${refId} sedang berjalan (webhook ganda)`); return { skipped: "locked" }; }
+
+  deductLocks.add(refId);
+  try {
+    const user = (existing.data && existing.data.customer_name) || loc.user;
+    const base = Number(wd.selling_price || wd.price || (existing.data && existing.data.price) || 0);
+    if (!base) { hookLog.error(`Harga ${refId} tidak diketahui, saldo TIDAK dipotong (perlu manual)`, { user }); return { skipped: "no-price" }; }
+
+    const { admin_fee, markup } = await getUserMarkup(user);
+    const total = Math.round(base + admin_fee + markup);
+    hookLog.info(`Memotong saldo ${refId} (Pending → Sukses)`, { user, base, admin_fee, markup, total });
+
+    const r = await saldoApi({
+      action: "adjust_balance", value: user, amount: -Math.abs(total),
+      note: `Transaksi ${existing.data.product_name || existing.data.buyer_sku_code} | ${existing.data.customer_no} | Rp ${total.toLocaleString("id-ID")}`
     });
 
-    if (response.data && response.data.data) {
-      res.json({
-        success: true,
-        data: {
-          message: response.data.data.message,
-          status: response.data.data.status,
-          rc: response.data.data.rc,
-          customer_no: response.data.data.customer_no,
-          meter_no: response.data.data.meter_no,
-          subscriber_id: response.data.data.subscriber_id,
-          name: response.data.data.name,
-          segment_power: response.data.data.segment_power
-        }
-      });
-    } else {
-      res.json({ success: false, message: "Gagal mendapatkan informasi pelanggan" });
+    if (r && r.success) {
+      await fbUpdate(`${loc.path}/data`, { balance_deducted: true, balance_deducted_amount: total, balance_deducted_at: Date.now() });
+      hookLog.info(`Saldo ${refId} berhasil dipotong`, { user, total });
+      await notifyUser(user, `✅ *TRANSAKSI BERHASIL!*\n\nProduk: ${existing.data.product_name || existing.data.buyer_sku_code}\nNomor/ID: ${existing.data.customer_no}\nNominal: Rp ${total.toLocaleString("id-ID")}\nWaktu: ${new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" })}\n\nTerima kasih telah bertransaksi!`);
+      return { deducted: total };
     }
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    hookLog.error(`PEMOTONGAN SALDO GAGAL untuk ${refId} — PERLU DIPOTONG MANUAL`, { user, total, response: r });
+    await fbUpdate(`${loc.path}/data`, { balance_deduct_failed: true, balance_deduct_error: (r && r.message) || "unknown" }).catch(() => { });
+    return { failed: true };
+  } finally { deductLocks.delete(refId); }
+}
+
+async function applyWebhook(refId, payload) {
+  const loc = await findTransaction(refId);
+  if (!loc) { hookLog.warn(`Transaksi ${refId} tidak ditemukan di database`); return { found: false }; }
+
+  const snap = await fbGet(loc.path);
+  if (!snap.exists()) { hookLog.warn(`Path ${loc.path} kosong`); return { found: false }; }
+
+  const existing = snap.val();
+  const wd = payload.data || {};
+  const oldStatus = existing.data && existing.data.status;
+  const newStatus = wd.status || oldStatus;
+
+  const merged = {
+    ...existing,
+    data: clean({
+      ...existing.data, ...wd,
+      status: newStatus,
+      sn: wd.sn || (existing.data && existing.data.sn) || "",
+      message: wd.message || (existing.data && existing.data.message),
+      rc: wd.rc || (existing.data && existing.data.rc),
+      webhook_updated: true, webhook_updated_at: Date.now(), webhook_id: CONFIG.webhookId,
+      application: CONFIG.appName
+    }),
+    webhook_last_update: new Date().toISOString(),
+    webhook_source: "digiflazz"
+  };
+  await fbSet(loc.path, merged);
+  hookLog.info(`Transaksi ${refId} diperbarui`, { user: loc.user, oldStatus, newStatus, rc: wd.rc, sn: wd.sn });
+
+  let deduct;
+  const user = (existing.data && existing.data.customer_name) || loc.user;
+  if (newStatus === "Sukses" && oldStatus === "Pending") {
+    deduct = await lateDeduct(loc, refId, { ...existing }, wd);
+  } else if (newStatus === "Gagal" && oldStatus === "Pending") {
+    hookLog.info(`Transaksi ${refId} Pending → Gagal, saldo tidak pernah dipotong`);
+    await notifyUser(user, `❌ *TRANSAKSI GAGAL!*\n\nProduk: ${(existing.data && (existing.data.product_name || existing.data.buyer_sku_code)) || "-"}\nNomor/ID: ${(existing.data && existing.data.customer_no) || "-"}\nAlasan: ${wd.message || "-"}\n\nSaldo Anda tidak terpotong.`);
+  } else if (newStatus === "Sukses" && oldStatus === "Sukses") {
+    hookLog.info(`Webhook ${refId} duplikat (sudah Sukses), diabaikan`);
   }
+  return { found: true, user: loc.user, oldStatus, newStatus, deduct };
+}
+
+async function saveWebhookLog(body, headers, status, message) {
+  try {
+    const r = push(ref(database, DB.webhookLogs));
+    await set(r, clean({
+      timestamp: Date.now(), date: new Date().toISOString(), webhook_id: CONFIG.webhookId,
+      headers: { "user-agent": headers["user-agent"], "x-digiflazz-event": headers["x-digiflazz-event"], "x-hub-signature": headers["x-hub-signature"] ? "present" : "missing" },
+      payload: body, processing_status: status, processing_message: message,
+      ip: headers["x-forwarded-for"] || headers.host, application: CONFIG.appName
+    }));
+  } catch (e) { hookLog.error("Gagal menyimpan log webhook ke Firebase", errMeta(e)); }
+}
+
+app.post("/webhook/digiflazz", async (req, res) => {
+  const t0 = Date.now();
+  const h = req.headers, body = req.body || {};
+  const sig = h["x-hub-signature"];
+  hookLog.info("Webhook diterima", { event: h["x-digiflazz-event"], ua: h["user-agent"], ip: req.ip, hasSignature: !!sig, bytes: req.rawBody ? req.rawBody.length : 0 });
+  hookLog.debug("Webhook body", { body });
+
+  // Verifikasi signature memakai raw body (bukan hasil JSON.stringify ulang)
+  let verification = "skipped";
+  if (sig) {
+    const expected = "sha1=" + crypto.createHmac("sha1", CONFIG.webhookSecret).update(req.rawBody || "").digest("hex");
+    if (!safeEqual(sig, expected)) {
+      hookLog.error("Signature webhook TIDAK VALID", { received: String(sig).slice(0, 12) + "…" });
+      await saveWebhookLog(body, h, "failed", "Invalid signature");
+      return res.status(401).json({ error: "Invalid signature" });
+    }
+    verification = "success";
+  } else if (CONFIG.requireWebhookSig) {
+    hookLog.error("Webhook tanpa signature ditolak");
+    await saveWebhookLog(body, h, "failed", "Missing signature");
+    return res.status(401).json({ error: "Missing signature" });
+  } else hookLog.warn("Webhook tanpa signature diterima (REQUIRE_WEBHOOK_SIGNATURE=false)");
+
+  const ua = h["user-agent"];
+  const type = ua === "Digiflazz-Hookshot" ? "prepaid" : ua === "Digiflazz-Pasca-Hookshot" ? "postpaid" : "unknown";
+  hookLog.info(`Tipe webhook: ${type}`);
+
+  let status = 200, message, result = { found: false };
+  const refId = body.data && body.data.ref_id;
+  if (refId) {
+    hookLog.info(`Memproses ref_id ${refId}`, { status: body.data.status, rc: body.data.rc });
+    try {
+      result = await applyWebhook(refId, body);
+      message = result.found ? `Transaction ${refId} updated ${result.oldStatus || "unknown"} -> ${result.newStatus}` : `Transaction ${refId} not found`;
+    } catch (e) {
+      hookLog.error(`Gagal memproses webhook ${refId}`, errMeta(e));
+      status = 500; message = "Internal server error"; // 500 agar Digiflazz mengirim ulang
+    }
+  } else if ((body.zen || body.sed) && body.hook_id) {
+    message = "Ping event received"; hookLog.info("Ping dari Digiflazz");
+  } else {
+    message = "Received but no ref_id"; hookLog.warn("Webhook tanpa ref_id", { keys: Object.keys(body) });
+  }
+
+  await saveWebhookLog(body, h, status !== 200 ? "error" : result.found ? "success" : "warning", message);
+  const ms = Date.now() - t0;
+  hookLog.info(`Webhook selesai ${ms}ms`, { status, message });
+  res.status(status).json({ success: result.found, message, ref_id: refId || null, status: (body.data && body.data.status) || null, application: CONFIG.appName, processing_time_ms: ms, verification });
 });
 
-app.post("/api/history", async (req, res) => {
-  try {
-    const { username, limit = 50 } = req.body;
-    if (!username) return res.status(400).json({ success: false, error: "Username required" });
-
-    const prepaidRef = ref(database, `trxppobgaskuy/${username}`);
-    const pascaRef = ref(database, `trxpascagaskuy/${username}`);
-
-    const [prepaidSnap, pascaSnap] = await Promise.all([get(prepaidRef), get(pascaRef)]);
-    let transactions = [];
-
-    if (prepaidSnap.exists()) {
-      const data = prepaidSnap.val();
-      for (const [refId, item] of Object.entries(data)) {
-        const trxData = item.data || {};
-        transactions.push({
-          product_name: trxData.product_name || trxData.buyer_sku_code || "-",
-          customer_no: trxData.customer_no || "-",
-          price_sell: trxData.price || trxData.selling_price || 0,
-          status: trxData.status || "Unknown",
-          created_at: item.date || new Date(item.timestamp).toISOString(),
-          sn: trxData.sn || null,
-          sku_code: trxData.buyer_sku_code || null,
-          ref_id: refId,
-          webhook_updated: trxData.webhook_updated || false,
-          application: trxData.application || "mudico"
-        });
-      }
-    }
-
-    if (pascaSnap.exists()) {
-      const data = pascaSnap.val();
-      for (const [refId, item] of Object.entries(data)) {
-        const trxData = item.data || {};
-        transactions.push({
-          product_name: trxData.product_name || trxData.buyer_sku_code || "-",
-          customer_no: trxData.customer_no || "-",
-          price_sell: trxData.price || trxData.selling_price || 0,
-          status: trxData.status || "Unknown",
-          created_at: item.date || new Date(item.timestamp).toISOString(),
-          sn: trxData.sn || null,
-          sku_code: trxData.buyer_sku_code || null,
-          ref_id: refId,
-          webhook_updated: trxData.webhook_updated || false,
-          application: trxData.application || "mudico"
-        });
-      }
-    }
-
-    transactions.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-    if (limit > 0) transactions = transactions.slice(0, limit);
-
-    res.json({ success: true, data: transactions });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
+app.post("/webhook/ping", async (req, res) => {
+  hookLog.info("Ping manual diterima");
+  await saveWebhookLog(req.body, req.headers, "ping", "Ping event received");
+  res.json({ success: true, message: "Pong! Webhook is active", application: CONFIG.appName });
 });
 
-app.post("/refresh-products", async (req, res) => {
-  const { secret } = req.body;
-  if (secret !== REFRESH_SECRET) return res.status(403).json({ success: false, error: "Unauthorized" });
-  try {
-    const result = await refreshAllCache();
-    res.json({ success: true, message: "Cache refreshed", prepaidCount: result.prepaidCount, pascaCount: result.pascaCount });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
-  }
+app.get("/webhook/info", (req, res) => res.json({
+  application: CONFIG.appName, webhook_id: CONFIG.webhookId, status: "active",
+  endpoints: { main: "/webhook/digiflazz", ping: "/webhook/ping" },
+  late_deduct: CONFIG.lateDeduct, signature_required: CONFIG.requireWebhookSig
+}));
+
+/* ============================================================
+ *  ENDPOINT ADMIN (butuh ADMIN_SECRET via header x-admin-secret / body.secret)
+ * ============================================================ */
+app.post("/refresh-products", adminAuth, async (req, res) => {
+  log.info("Refresh manual pricelist diminta");
+  const r = await refreshAll("manual");
+  if (!r.success) return res.status(502).json({ success: false, ...r });
+  res.json({ success: true, message: "Cache refreshed", ...r });
 });
 
 app.get("/cache-status", (req, res) => {
   const now = Date.now();
-  res.json({
-    application: "mudico",
-    firebase_paths: "gaskuy (trxppobgaskuy, trxpascagaskuy, cache/pricelist, webhook_logs)",
-    prepaid: {
-      loaded: !!prepaidCache,
-      productCount: prepaidCache?.data?.length || 0,
-      lastUpdated: prepaidCacheTime ? new Date(prepaidCacheTime).toISOString() : null,
-      ageMinutes: prepaidCacheTime ? Math.floor((now - prepaidCacheTime) / 60000) : null,
-      isExpired: !prepaidCache || (now - prepaidCacheTime) > CACHE_TTL
-    },
-    pasca: {
-      loaded: !!pascaCache,
-      productCount: pascaCache?.data?.length || 0,
-      lastUpdated: pascaCacheTime ? new Date(pascaCacheTime).toISOString() : null,
-      ageMinutes: pascaCacheTime ? Math.floor((now - pascaCacheTime) / 60000) : null,
-      isExpired: !pascaCache || (now - pascaCacheTime) > CACHE_TTL
-    },
-    cacheTTL_minutes: CACHE_TTL / 60000,
-    serverTime: new Date().toISOString()
-  });
+  const info = (t) => {
+    const s = pl[t];
+    return { loaded: !!s.list, productCount: s.list ? s.list.length : 0, lastUpdated: s.ts ? new Date(s.ts).toISOString() : null, ageMinutes: s.ts ? Math.floor((now - s.ts) / 60000) : null, isExpired: !s.list || now - s.ts > CONFIG.cacheTtlMs, refreshing: !!s.inflight };
+  };
+  res.json({ application: CONFIG.appName, firebase_paths: DB, prepaid: info("prepaid"), pasca: info("pasca"), cacheTTL_minutes: CONFIG.cacheTtlMs / 60000, cron: CONFIG.pricelistCron, serverTime: new Date().toISOString() });
 });
 
-app.post("/direct-prepaid", async (req, res) => {
-  const url = "https://api.digiflazz.com/v1/price-list";
-  const data = { cmd: "prepaid", username: username, sign: generatePriceListSignature() };
+// Ambil pricelist langsung dari Digiflazz. Body: { sku?: "S2", full?: true }
+app.post("/direct-prepaid", adminAuth, async (req, res) => {
   try {
-    const response = await axios.post(url, data, { headers: { "Content-Type": "application/json" }, timeout: 30000 });
-    res.json({ success: true, source: "direct_from_digiflazz", totalProducts: response.data.data?.length || 0, products: response.data.data });
-  } catch (error) {
-    res.status(500).json({ success: false, error: error.message });
+    const list = await fetchPricelist("prepaid");
+    const sku = req.body && req.body.sku;
+    const out = { success: true, source: "direct_from_digiflazz", totalProducts: list.length };
+    if (sku) out.matches = list.filter(p => p.buyer_sku_code === sku);
+    if (req.body && req.body.full) out.products = list;
+    res.json(out);
+  } catch (e) {
+    log.error("direct-prepaid gagal", { ...errMeta(e), digiflazz: e.digiflazz });
+    res.status(502).json({ success: false, error: e.message, digiflazz: e.digiflazz || (e.response && e.response.data) || null });
   }
 });
 
-// ============ JALANKAN SERVER ============
-app.listen(port, '0.0.0.0', () => {
-  console.log(`
-╔════════════════════════════════════════════════════════════════╗
-║     🚀 MUDICO DIGIFLAZZ BACKEND STARTED 🚀                    ║
-╠════════════════════════════════════════════════════════════════╣
-║  Application: MUDICO                                          ║
-║  Webhook ID: ${WEBHOOK_ID}                                      ║
-║  Mode: WEBHOOK ONLY (No Polling)                              ║
-║  Firebase Paths: GASKUY (trxppobgaskuy, trxpascagaskuy)       ║
-║  Local:    http://localhost:${port}                            ║
-║  Network:  http://192.168.x.x:${port}                         ║
-╠════════════════════════════════════════════════════════════════╣
-║  🔗 WEBHOOK ENDPOINTS:                                        ║
-║  POST /webhook/digiflazz   - Main webhook dari Digiflazz      ║
-║  POST /webhook/ping        - Test webhook ping                ║
-║  GET  /webhook/logs        - View webhook logs                ║
-║  GET  /webhook/stats       - Webhook statistics               ║
-║  GET  /webhook/info        - Webhook information              ║
-║  GET  /webhook/test-ping   - Test ping to Digiflazz           ║
-╠════════════════════════════════════════════════════════════════╣
-║  📦 TRANSACTION ENDPOINTS (Webhook Only - No Polling):        ║
-║  POST /transaction         - Process prepaid (NO POLLING)     ║
-║  POST /transactionpasca    - Process postpaid (NO POLLING)    ║
-║  POST /inqpasca            - Inquiry postpaid                 ║
-╠════════════════════════════════════════════════════════════════╣
-║  📁 FIREBASE PATHS (Tetap GASKUY):                            ║
-║  trxppobgaskuy/     - Prepaid transactions                   ║
-║  trxpascagaskuy/    - Postpaid transactions                  ║
-║  cache/pricelist/   - Product cache                          ║
-║  webhook_logs/      - Webhook logs                           ║
-║  users/             - User markup data                       ║
-╠════════════════════════════════════════════════════════════════╣
-║  ⚡ PERBEDAAN DENGAN SEBELUMNYA:                              ║
-║  ❌ TIDAK ADA POLLING (tidak menunggu 100 detik)              ║
-║  ✅ Response LANGSUNG ke user (< 5 detik)                     ║
-║  ✅ Webhook akan update status REAL-TIME                      ║
-║  ✅ Tidak ada risiko timeout                                   ║
-║  ✅ Lebih efisien dan cepat                                    ║
-║  ✅ Firebase path tetap GASKUY (compatible dengan data lama)  ║
-║  ✅ Application label MUDICO untuk identifikasi               ║
-╚════════════════════════════════════════════════════════════════╝
-  `);
+// Bandingkan produk di cache vs langsung dari Digiflazz: /admin/product-check?sku=S2&direct=1
+app.get("/admin/product-check", adminAuth, async (req, res) => {
+  const sku = req.query.sku;
+  if (!sku) return res.status(400).json({ success: false, error: "parameter sku wajib" });
+  const pick = (l) => (l || []).filter(p => p.buyer_sku_code === sku);
+  const out = { sku, cache: { ageMinutes: pl.prepaid.ts ? Math.floor((Date.now() - pl.prepaid.ts) / 60000) : null, items: pick(pl.prepaid.list) } };
+  if (req.query.direct) {
+    try { out.direct = pick(await fetchPricelist("prepaid")); }
+    catch (e) { out.direct = { error: e.message, digiflazz: e.digiflazz || null }; }
+  }
+  res.json(out);
 });
+
+// Lihat log terbaru: /admin/logs?lines=200&level=error&q=ref_id
+app.get("/admin/logs", adminAuth, (req, res) => {
+  const n = Math.min(parseInt(req.query.lines || "200", 10) || 200, RING_MAX);
+  const level = String(req.query.level || "").toUpperCase();
+  const q = String(req.query.q || "").toLowerCase();
+  let lines = ringBuffer;
+  if (level) lines = lines.filter(l => l.slice(24, 29).trim() === level);
+  if (q) lines = lines.filter(l => l.toLowerCase().includes(q));
+  res.type("text/plain").send(lines.slice(-n).join("\n") || "(log kosong)");
+});
+
+app.get("/webhook/logs", adminAuth, async (req, res) => {
+  try {
+    const n = Math.min(parseInt(req.query.limit || "50", 10) || 50, 200);
+    const snap = await get(query(ref(database, DB.webhookLogs), orderByKey(), limitToLast(n)));
+    const logs = snap.exists() ? Object.entries(snap.val()).map(([id, v]) => ({ id, ...v })).sort((a, b) => b.timestamp - a.timestamp) : [];
+    res.json({ success: true, total_logs: logs.length, logs });
+  } catch (e) { log.error("Ambil webhook logs gagal", errMeta(e)); res.status(500).json({ success: false, error: e.message }); }
+});
+
+app.get("/webhook/stats", adminAuth, async (req, res) => {
+  try {
+    const snap = await get(query(ref(database, DB.webhookLogs), orderByKey(), limitToLast(500)));
+    const stats = { sampled: 0, success: 0, warning: 0, failed: 0, error: 0, ping: 0, last_24h: 0 };
+    const since = Date.now() - 86400000;
+    if (snap.exists()) Object.values(snap.val()).forEach(l => { stats.sampled++; if (stats[l.processing_status] !== undefined) stats[l.processing_status]++; if (l.timestamp > since) stats.last_24h++; });
+    res.json({ success: true, stats, server_time: new Date().toISOString() });
+  } catch (e) { res.status(500).json({ success: false, error: e.message }); }
+});
+
+/* ============================================================
+ *  404 + ERROR HANDLER
+ * ============================================================ */
+app.use((req, res) => res.status(404).json({ success: false, error: "Not found" }));
+app.use((err, req, res, next) => {
+  const badJson = err.type === "entity.parse.failed";
+  log.error(badJson ? "JSON request tidak valid" : "Error tak tertangani", errMeta(err));
+  if (res.headersSent) return next(err);
+  res.status(badJson ? 400 : 500).json({ success: false, error: badJson ? "JSON tidak valid" : "Internal Server Error" });
+});
+
+/* ============================================================
+ *  CRON + STARTUP
+ * ============================================================ */
+if (cron.validate(CONFIG.pricelistCron)) {
+  cron.schedule(CONFIG.pricelistCron, () => {
+    als.run({ reqId: "cron" }, async () => {
+      cronLog.info(`Trigger refresh pricelist (${CONFIG.pricelistCron})`);
+      const r = await refreshAll("cron");
+      if (r.success) cronLog.info("Refresh selesai", { prepaid: r.prepaidCount, pasca: r.pascaCount });
+      else cronLog.error("Refresh selesai dengan error", r);
+    });
+  }, { timezone: "Asia/Jakarta" });
+} else log.error(`Ekspresi cron tidak valid: ${CONFIG.pricelistCron}`);
+
+async function bootstrap() {
+  await loadCacheFromFirebase();
+  const expired = (t) => !pl[t].list || Date.now() - pl[t].ts > CONFIG.cacheTtlMs;
+  if (expired("prepaid") || expired("pasca")) {
+    log.info("Cache kosong/kedaluwarsa, mengambil data baru dari Digiflazz");
+    const r = await refreshAll("startup");
+    if (!r.success) log.error("Pengambilan awal pricelist GAGAL", r);
+  } else log.info("Cache masih valid, melewati pengambilan awal");
+}
+
+if (!missing.length) {
+  const server = app.listen(CONFIG.port, "0.0.0.0", () => {
+    log.info(`Server ${CONFIG.appName.toUpperCase()} berjalan di port ${CONFIG.port}`, {
+      node: process.version, logLevel: Object.keys(LEVELS).find(k => LEVELS[k] === LOG_LEVEL),
+      logToFile: LOG_TO_FILE, logDir: LOG_DIR, maskPII: MASK_PII,
+      firebasePaths: DB, saldoApi: CONFIG.saldoApiUrl, lateDeduct: CONFIG.lateDeduct,
+      cron: CONFIG.pricelistCron, cacheTtlMin: CONFIG.cacheTtlMs / 60000, webhookSignatureRequired: CONFIG.requireWebhookSig
+    });
+    pruneLogs();
+    setInterval(pruneLogs, 24 * 3600 * 1000).unref();
+    bootstrap().catch(e => log.error("Bootstrap gagal", errMeta(e)));
+  });
+
+  const shutdown = (sig) => {
+    log.info(`${sig} diterima, menutup server...`);
+    server.close(() => { log.info("Server ditutup"); process.exit(0); });
+    setTimeout(() => process.exit(1), 10000).unref();
+  };
+  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => shutdown("SIGINT"));
+}
