@@ -213,26 +213,19 @@ cron.schedule("5 0 * * *", async () => {
 
 async function checkTransactionStatus(postData) {
   const url = "https://api.digiflazz.com/v1/transaction";
-
-  const sign = generateSignature(postData.ref_id);
-  postData.sign = sign;
-
-  console.log(`📊 [checkStatus] Checking transaction for ref_id: ${postData.ref_id}`);
-  console.log(`   Sign: ${sign}`);
+  postData.sign = generateSignature(postData.ref_id);
 
   try {
     const response = await axios.post(url, postData, {
       headers: { "Content-Type": "application/json" },
       timeout: 30000
     });
-    console.log(`   Response status: ${response.data.data?.status || 'Unknown'}`);
     return response.data;
   } catch (error) {
-    if (error.response) {
-      console.error("   API error response:", error.response.data);
-      console.error("   API error status:", error.response.status);
+    // Digiflazz membalas 400 tapi body-nya tetap berisi status transaksi
+    if (error.response && error.response.data && error.response.data.data) {
+      return error.response.data;
     }
-    console.error("   Error checking transaction status:", error.message);
     throw new Error("Failed to check transaction status");
   }
 }
